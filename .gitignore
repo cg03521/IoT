@@ -1,0 +1,6 @@
+**/.pio/
+**/.**code**browse.c_cpp.db****/.vscode/ipch/
+
+*.bin
+*.elf
+*.m***
