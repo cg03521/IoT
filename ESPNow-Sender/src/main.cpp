@@ -3,128 +3,114 @@
 #include <espnow.h>
 #include <DHT.h>
 
+// ============================================================
+// CONFIGURAZIONE NODO ED HARDWARE
+// ============================================================
+
+constexpr char LOCATION_LABEL[] = "Esterno";
 #define DHTPIN D4
 #define DHTTYPE DHT22
 
-DHT dht(DHTPIN, DHTTYPE);
+// Intervallo di invio: 60 secondi (in millisecondi)
+constexpr uint32_t SEND_INTERVAL_MS = 60000; 
+constexpr uint8_t WIFI_CHANNEL = 1;
 
-// MAC ADDRESS DEL RICEVITORE
-// SOSTITUIRE CON IL MAC REALE
+uint8_t receiverMac[] = { 0x60, 0x01, 0x94, 0x74, 0x62, 0x05 };
 
-uint8_t receiverMac[] =
-{
-    0xDC,
-    0x4F,
-    0x22,
-    0x0B,
-    0x66,
-    0x65
-};
-
-struct SensorData
-{
+struct __attribute__((packed)) SensorData {
+    char location[16];
     float temperature;
     float humidity;
 };
 
 SensorData sensorData;
+DHT dht(DHTPIN, DHTTYPE);
 
-unsigned long lastSend = 0;
+volatile bool sendCompleted = false;
+volatile uint8_t sendStatus = 1;
+uint32_t lastSendTime = 0;
 
-void onDataSent(uint8_t *mac_addr, uint8_t status)
-{
-    Serial.print("Invio: ");
+void onDataSent(uint8_t *mac_addr, uint8_t status) {
+    sendStatus = status;
+    sendCompleted = true;
+}
 
-    if (status == 0)
-    {
-        Serial.println("OK");
+void readAndSendData() {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    if (isnan(t) || isnan(h)) {
+        Serial.println(F("Errore di lettura dal sensore DHT22!"));
+        return;
     }
-    else
-    {
-        Serial.println("ERRORE");
+
+    Serial.printf("Lettura [%s]: Temp = %.1f °C, Umidita = %.1f %%\n", LOCATION_LABEL, t, h);
+
+    memset(&sensorData, 0, sizeof(sensorData));
+    strncpy(sensorData.location, LOCATION_LABEL, sizeof(sensorData.location) - 1);
+    sensorData.temperature = t;
+    sensorData.humidity = h;
+
+    sendCompleted = false;
+    uint8_t result = esp_now_send(receiverMac, (uint8_t *)&sensorData, sizeof(sensorData));
+
+    if (result != 0) {
+        Serial.printf("Errore invocazione esp_now_send: %d\n", result);
+    } else {
+        uint32_t startWait = millis();
+        while (!sendCompleted && (millis() - startWait < 250)) {
+            delay(1);
+        }
+
+        if (sendCompleted) {
+            Serial.print(F("Stato invio ESP-NOW: "));
+            Serial.println(sendStatus == 0 ? F("OK") : F("ERRORE (No ACK dal Ricevitore)"));
+        } else {
+            Serial.println(F("Stato invio ESP-NOW: TIMEOUT"));
+        }
     }
 }
 
-void setup()
-{
+void setup() {
     Serial.begin(115200);
-
     Serial.println();
-    Serial.println("ESP-NOW DHT22 Sender");
+    Serial.println(F("--- Wemos D1 Mini: Sender ESP-NOW (Continuous Mode) ---"));
 
     dht.begin();
 
+    // Attesa necessaria per la stabilizzazione del DHT22 all'accensione
+    delay(2000);
+
+    // Inizializzazione Wi-Fi in Station Mode permanente
+    WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    
+    wifi_set_channel(WIFI_CHANNEL);
+    delay(100);
 
-    Serial.print("MAC Sender: ");
-    Serial.println(WiFi.macAddress());
-
-    if (esp_now_init() != 0)
-    {
-        Serial.println("Errore inizializzazione ESP-NOW");
-
-        while (true)
-        {
-            delay(1000);
-        }
+    // Inizializzazione ESP-NOW
+    if (esp_now_init() != 0) {
+        Serial.println(F("Errore critico durante l'inizializzazione di ESP-NOW!"));
+        return;
     }
 
     esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
-
     esp_now_register_send_cb(onDataSent);
 
-    if (esp_now_add_peer(
-            receiverMac,
-            ESP_NOW_ROLE_SLAVE,
-            1,
-            NULL,
-            0) != 0)
-    {
-        Serial.println("Errore aggiunta peer");
-
-        while (true)
-        {
-            delay(1000);
-        }
+    if (esp_now_add_peer(receiverMac, ESP_NOW_ROLE_SLAVE, WIFI_CHANNEL, NULL, 0) != 0) {
+        Serial.println(F("Errore registrazione peer!"));
     }
 
-    Serial.println("Pronto");
+    // Primo invio immediato al boot
+    readAndSendData();
+    lastSendTime = millis();
 }
 
-void loop()
-{
-    if (millis() - lastSend >= 5000)
-    {
-        lastSend = millis();
-
-        float h = dht.readHumidity();
-        float t = dht.readTemperature();
-
-        if (!isnan(t) && !isnan(h))
-        {
-            sensorData.temperature = t;
-            sensorData.humidity = h;
-
-            Serial.printf(
-                "T=%.1f°C  H=%.1f%%\n",
-                t,
-                h);
-
-            uint8_t result = esp_now_send(
-                receiverMac,
-                (uint8_t *)&sensorData,
-                sizeof(sensorData));
-
-            if (result != 0)
-            {
-                Serial.printf(
-                    "Errore invio ESP-NOW: %d\n",
-                    result);
-            }
-        }
-        else
-        {
-            Serial.println("Errore lettura DHT");
-        }
+void loop() {
+    // Esecuzione temporizzata ogni 60 secondi
+    if (millis() - lastSendTime >= SEND_INTERVAL_MS) {
+        lastSendTime = millis();
+        readAndSendData();
     }
 }

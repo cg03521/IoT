@@ -13,18 +13,20 @@ constexpr char AP_PASSWORD[] = "Meteo2026";
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint16_t WEB_SERVER_PORT = 80;
 
-// Il trasmettitore invia ogni 5 secondi.
-// Dopo 15 secondi senza pacchetti viene indicato come non aggiornato.
-constexpr uint32_t OFFLINE_TIMEOUT_MS = 15000;
+// Timeout dopo il quale un trasmettitore è considerato offline
+constexpr uint32_t OFFLINE_TIMEOUT_MS = 180000;
 
 // ============================================================
-// CONFIGURAZIONE STORICO
+// STRUTTURE DATI
 // ============================================================
 
 constexpr uint16_t HISTORY_SIZE = 100;
+constexpr uint8_t MAX_SENSORS = 8; // Supporto dinamico fino a 8 sensori
 
+// Struttura inviata dal trasmettitore
 struct SensorData
 {
+    char sensorName[16]; // Nome inviato dal trasmettitore (es. "Esterno", "Salotto")
     float temperature;
     float humidity;
 };
@@ -36,11 +38,23 @@ struct HistorySample
     uint32_t timestampSeconds;
 };
 
-// Buffer circolare di 100 campioni.
-HistorySample historyBuffer[HISTORY_SIZE];
+struct SensorNode
+{
+    uint8_t mac[6];
+    char macStr[18];
+    char name[24];
+    SensorData currentData;
+    bool hasData = false;
+    uint32_t packetCount = 0;
+    uint32_t lastUpdateMs = 0;
 
-uint16_t historyStart = 0;
-uint16_t historyCount = 0;
+    HistorySample historyBuffer[HISTORY_SIZE];
+    uint16_t historyStart = 0;
+    uint16_t historyCount = 0;
+};
+
+SensorNode sensors[MAX_SENSORS];
+uint8_t activeSensorCount = 0;
 
 // ============================================================
 // SERVER WEB
@@ -49,31 +63,15 @@ uint16_t historyCount = 0;
 ESP8266WebServer server(WEB_SERVER_PORT);
 
 // ============================================================
-// DATI RICEVUTI
+// DATI RICEVUTI DA CALLBACK
 // ============================================================
 
-// La callback copia qui il nuovo pacchetto.
-// Il pacchetto sarà elaborato nel loop principale.
 volatile bool pendingPacketAvailable = false;
-
 SensorData pendingData {};
 uint8_t pendingSenderMac[6] = {};
 
-// Ultimi dati elaborati.
-SensorData receivedData {};
-
-char senderMacString[18] = "--";
-
-bool hasReceivedData = false;
-
-uint32_t packetCounter = 0;
-uint32_t lastUpdateMs = 0;
-
 // ============================================================
-// PAGINA WEB
-//
-// Memorizzata in Flash con PROGMEM per non occupare inutilmente RAM.
-// I grafici usano Canvas, quindi non richiedono Internet.
+// PAGINA WEB DEDICATA (PROGMEM)
 // ============================================================
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -81,961 +79,450 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <html lang="it">
 <head>
     <meta charset="UTF-8">
-
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0">
-
-    <title>ESP-NOW Meteo</title>
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stazione Meteo ESP-NOW</title>
     <style>
-        * {
-            box-sizing: border-box;
-        }
-
+        * { box-sizing: border-box; }
         body {
             margin: 0;
             padding: 20px;
-            font-family: Arial, Helvetica, sans-serif;
-            color: #17212b;
-            background: #eef3f8;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            color: #1e293b;
+            background: #f1f5f9;
         }
+        .container { max-width: 960px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 20px; }
+        h1 { margin: 0 0 6px 0; color: #0f172a; font-size: 28px; }
+        .subtitle { color: #64748b; margin: 0; font-size: 15px; }
 
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            overflow-x: auto;
+            padding-bottom: 4px;
         }
-
-        h1 {
-            margin-bottom: 5px;
-            text-align: center;
-            color: #075985;
-        }
-
-        .subtitle {
-            margin-top: 0;
-            text-align: center;
-            color: #64748b;
-        }
-
-        #status {
-            width: fit-content;
-            margin: 16px auto;
-            padding: 9px 18px;
-            border-radius: 20px;
-            font-weight: bold;
+        .tab-btn {
             background: #e2e8f0;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 12px;
+            font-weight: 600;
+            color: #475569;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+        .tab-btn.active {
+            background: #2563eb;
+            color: white;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
         }
 
-        .status-ok {
-            color: #166534;
-            background: #dcfce7 !important;
+        .status-badge {
+            display: inline-block;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 13px;
+            margin-bottom: 16px;
         }
-
-        .status-warning {
-            color: #9a3412;
-            background: #ffedd5 !important;
-        }
+        .status-ok { background: #dcfce7; color: #15803d; }
+        .status-warning { background: #ffedd5; color: #c2410c; }
+        .status-offline { background: #fee2e2; color: #b91c1c; }
 
         .cards {
             display: grid;
-            grid-template-columns:
-                repeat(auto-fit, minmax(230px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 16px;
             margin-bottom: 20px;
         }
-
         .card {
-            padding: 22px;
-            text-align: center;
             background: white;
+            padding: 20px;
             border-radius: 16px;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
         }
-
-        .label {
-            color: #64748b;
-            font-size: 17px;
-        }
-
-        .value {
-            margin-top: 8px;
-            color: #075985;
-            font-size: 38px;
-            font-weight: bold;
-        }
+        .card-title { color: #64748b; font-size: 14px; font-weight: 500; }
+        .card-value { font-size: 36px; font-weight: 700; margin-top: 8px; color: #0f172a; }
 
         .chart-card {
-            margin-bottom: 20px;
-            padding: 18px;
             background: white;
+            padding: 20px;
             border-radius: 16px;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
+            margin-bottom: 20px;
         }
-
-        .chart-card h2 {
-            margin-top: 0;
-            margin-bottom: 10px;
-            color: #334155;
-            font-size: 20px;
-        }
-
-        canvas {
-            display: block;
-            width: 100%;
-            height: 240px;
-            border-radius: 8px;
-            background: #ffffff;
-        }
+        .chart-card h2 { margin: 0 0 16px 0; font-size: 18px; color: #334155; }
+        canvas { width: 100%; height: 220px; display: block; }
 
         .details {
-            padding: 18px;
-            line-height: 1.9;
             background: white;
+            padding: 18px;
             border-radius: 16px;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+            border: 1px solid #e2e8f0;
+            font-size: 14px;
+            line-height: 1.8;
+            color: #475569;
         }
-
-        .details strong {
-            color: #334155;
-        }
-
-        .footer {
-            margin-top: 18px;
-            color: #64748b;
-            font-size: 13px;
-            text-align: center;
-        }
+        .details strong { color: #0f172a; }
 
         @media (max-width: 600px) {
-            body {
-                padding: 12px;
-            }
-
-            canvas {
-                height: 200px;
-            }
-
-            .value {
-                font-size: 32px;
-            }
+            body { padding: 12px; }
+            .card-value { font-size: 30px; }
         }
     </style>
 </head>
-
 <body>
     <div class="container">
-        <h1>ESP-NOW Meteo</h1>
+        <header>
+            <h1>Stazione Meteo ESP-NOW</h1>
+            <p class="subtitle">Ricevitore Multi-Nodo</p>
+        </header>
 
-        <p class="subtitle">
-            Ricevitore WeMos D1 Mini
-        </p>
+        <div id="tabs" class="tabs"></div>
 
-        <div id="status">
-            In attesa dei dati
-        </div>
+        <div id="statusBadge" class="status-badge status-warning">In attesa dei dati...</div>
 
         <div class="cards">
             <div class="card">
-                <div class="label">
-                    Temperatura
-                </div>
-
-                <div id="temperature" class="value">
-                    --.- °C
-                </div>
+                <div class="card-title">Temperatura</div>
+                <div id="tempVal" class="card-value">--.- °C</div>
             </div>
-
             <div class="card">
-                <div class="label">
-                    Umidita
-                </div>
-
-                <div id="humidity" class="value">
-                    --.- %
-                </div>
+                <div class="card-title">Umidità</div>
+                <div id="humVal" class="card-value">--.- %</div>
             </div>
         </div>
 
         <div class="chart-card">
-            <h2>
-                Storico temperatura
-            </h2>
-
-            <canvas id="temperatureChart"></canvas>
+            <h2>Storico Temperatura</h2>
+            <canvas id="tempChart"></canvas>
         </div>
 
         <div class="chart-card">
-            <h2>
-                Storico umidita
-            </h2>
-
-            <canvas id="humidityChart"></canvas>
+            <h2>Storico Umidità</h2>
+            <canvas id="humChart"></canvas>
         </div>
 
         <div class="details">
-            <strong>Mittente:</strong>
-            <span id="sender">--</span>
-            <br>
-
-            <strong>Pacchetti ricevuti:</strong>
-            <span id="packets">0</span>
-            <br>
-
-            <strong>Campioni memorizzati:</strong>
-            <span id="samples">0</span> / 100
-            <br>
-
-            <strong>Ultimo aggiornamento:</strong>
-            <span id="lastUpdate">--</span>
-        </div>
-
-        <div class="footer">
-            La pagina si aggiorna automaticamente ogni 2 secondi.
+            <div><strong>Modulo Sorgente:</strong> <span id="sensorName">--</span></div>
+            <div><strong>Indirizzo MAC:</strong> <span id="sensorMac">--</span></div>
+            <div><strong>Pacchetti Ricevuti:</strong> <span id="packetCount">0</span></div>
+            <div><strong>Campioni nello Storico:</strong> <span id="sampleCount">0</span> / 100</div>
+            <div><strong>Ultimo Aggiornamento:</strong> <span id="lastUpdate">--</span></div>
         </div>
     </div>
 
     <script>
-        let historyData = [];
+        let selectedSensorIndex = 0;
+        let sensorsData = [];
+
+        function renderTabs() {
+            const container = document.getElementById("tabs");
+            container.innerHTML = "";
+            sensorsData.forEach((sensor, idx) => {
+                const btn = document.createElement("button");
+                btn.className = "tab-btn " + (idx === selectedSensorIndex ? "active" : "");
+                btn.textContent = sensor.name;
+                btn.onclick = () => {
+                    selectedSensorIndex = idx;
+                    renderTabs();
+                    updateDisplay();
+                };
+                container.appendChild(btn);
+            });
+        }
 
         function resizeCanvas(canvas) {
             const ratio = window.devicePixelRatio || 1;
-            const rectangle = canvas.getBoundingClientRect();
+            const rect = canvas.getBoundingClientRect();
+            const width = rect.width;
+            const height = rect.height;
 
-            const width =
-                Math.max(300, Math.floor(rectangle.width));
-
-            const height =
-                Math.max(180, Math.floor(rectangle.height));
-
-            const internalWidth =
-                Math.floor(width * ratio);
-
-            const internalHeight =
-                Math.floor(height * ratio);
-
-            if (
-                canvas.width !== internalWidth ||
-                canvas.height !== internalHeight
-            ) {
-                canvas.width = internalWidth;
-                canvas.height = internalHeight;
+            if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
+                canvas.width = width * ratio;
+                canvas.height = height * ratio;
             }
-
-            const context = canvas.getContext("2d");
-
-            context.setTransform(ratio, 0, 0, ratio, 0, 0);
-
-            return {
-                context: context,
-                width: width,
-                height: height
-            };
+            const ctx = canvas.getContext("2d");
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+            return { ctx, width, height };
         }
 
-        function drawChart(
-            canvasId,
-            values,
-            color,
-            unit,
-            fixedMinimum,
-            fixedMaximum
-        ) {
-            const canvas =
-                document.getElementById(canvasId);
+        function drawChart(canvasId, values, color, unit, minVal, maxVal) {
+            const canvas = document.getElementById(canvasId);
+            const { ctx, width, height } = resizeCanvas(canvas);
+            ctx.clearRect(0, 0, width, height);
 
-            const drawing =
-                resizeCanvas(canvas);
-
-            const context =
-                drawing.context;
-
-            const width =
-                drawing.width;
-
-            const height =
-                drawing.height;
-
-            context.clearRect(0, 0, width, height);
-
-            const margin = {
-                left: 48,
-                right: 16,
-                top: 18,
-                bottom: 32
-            };
-
-            const graphWidth =
-                width - margin.left - margin.right;
-
-            const graphHeight =
-                height - margin.top - margin.bottom;
-
-            context.fillStyle = "#ffffff";
-            context.fillRect(0, 0, width, height);
+            const margin = { top: 20, right: 15, bottom: 25, left: 45 };
+            const graphWidth = width - margin.left - margin.right;
+            const graphHeight = height - margin.top - margin.bottom;
 
             if (!values || values.length === 0) {
-                context.fillStyle = "#64748b";
-                context.font = "14px Arial";
-                context.textAlign = "center";
-
-                context.fillText(
-                    "In attesa dei campioni",
-                    width / 2,
-                    height / 2
-                );
-
+                ctx.fillStyle = "#94a3b8";
+                ctx.font = "14px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText("Nessun dato disponibile per questo sensore", width / 2, height / 2);
                 return;
             }
 
-            let minimum =
-                fixedMinimum !== null
-                    ? fixedMinimum
-                    : Math.min(...values);
+            let min = minVal !== null ? minVal : Math.min(...values) - 0.5;
+            let max = maxVal !== null ? maxVal : Math.max(...values) + 0.5;
+            if (max <= min) max = min + 1;
+            const range = max - min;
 
-            let maximum =
-                fixedMaximum !== null
-                    ? fixedMaximum
-                    : Math.max(...values);
+            ctx.strokeStyle = "#f1f5f9";
+            ctx.lineWidth = 1;
+            ctx.fillStyle = "#94a3b8";
+            ctx.font = "11px sans-serif";
 
-            if (fixedMinimum === null) {
-                minimum -= 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = margin.top + (graphHeight * i / 4);
+                ctx.beginPath();
+                ctx.moveTo(margin.left, y);
+                ctx.lineTo(margin.left + graphWidth, y);
+                ctx.stroke();
+
+                const val = max - (range * i / 4);
+                ctx.textAlign = "right";
+                ctx.fillText(val.toFixed(1) + unit, margin.left - 6, y + 4);
             }
 
-            if (fixedMaximum === null) {
-                maximum += 1;
-            }
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
 
-            if (maximum <= minimum) {
-                maximum = minimum + 1;
-            }
+            values.forEach((v, i) => {
+                const x = values.length === 1 
+                    ? margin.left + graphWidth / 2 
+                    : margin.left + (graphWidth * i / (values.length - 1));
+                const y = margin.top + graphHeight * (max - v) / range;
 
-            const range =
-                maximum - minimum;
-
-            context.strokeStyle = "#e2e8f0";
-            context.lineWidth = 1;
-
-            context.fillStyle = "#64748b";
-            context.font = "11px Arial";
-
-            for (let line = 0; line <= 4; line++) {
-                const y =
-                    margin.top +
-                    (graphHeight * line / 4);
-
-                context.beginPath();
-                context.moveTo(margin.left, y);
-                context.lineTo(
-                    margin.left + graphWidth,
-                    y
-                );
-                context.stroke();
-
-                const value =
-                    maximum -
-                    (range * line / 4);
-
-                context.textAlign = "right";
-
-                context.fillText(
-                    value.toFixed(1) + unit,
-                    margin.left - 6,
-                    y + 4
-                );
-            }
-
-            context.strokeStyle = "#94a3b8";
-            context.lineWidth = 1;
-
-            context.beginPath();
-            context.moveTo(
-                margin.left,
-                margin.top
-            );
-            context.lineTo(
-                margin.left,
-                margin.top + graphHeight
-            );
-            context.lineTo(
-                margin.left + graphWidth,
-                margin.top + graphHeight
-            );
-            context.stroke();
-
-            context.strokeStyle = color;
-            context.lineWidth = 2.5;
-            context.lineJoin = "round";
-            context.lineCap = "round";
-
-            context.beginPath();
-
-            values.forEach((value, index) => {
-                const x =
-                    values.length === 1
-                        ? margin.left + graphWidth / 2
-                        : margin.left +
-                          graphWidth *
-                          index /
-                          (values.length - 1);
-
-                const y =
-                    margin.top +
-                    graphHeight *
-                    (maximum - value) /
-                    range;
-
-                if (index === 0) {
-                    context.moveTo(x, y);
-                } else {
-                    context.lineTo(x, y);
-                }
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
             });
+            ctx.stroke();
+        }
 
-            context.stroke();
+        function updateDisplay() {
+            if (sensorsData.length === 0) return;
+            const s = sensorsData[selectedSensorIndex];
 
-            if (values.length <= 30) {
-                context.fillStyle = color;
+            document.getElementById("sensorName").textContent = s.name;
+            document.getElementById("sensorMac").textContent = s.mac;
+            document.getElementById("packetCount").textContent = s.packets;
+            document.getElementById("sampleCount").textContent = s.samples;
 
-                values.forEach((value, index) => {
-                    const x =
-                        values.length === 1
-                            ? margin.left + graphWidth / 2
-                            : margin.left +
-                              graphWidth *
-                              index /
-                              (values.length - 1);
-
-                    const y =
-                        margin.top +
-                        graphHeight *
-                        (maximum - value) /
-                        range;
-
-                    context.beginPath();
-                    context.arc(x, y, 3, 0, Math.PI * 2);
-                    context.fill();
-                });
+            const badge = document.getElementById("statusBadge");
+            if (!s.valid) {
+                badge.textContent = "Nessun dato ancora ricevuto";
+                badge.className = "status-badge status-warning";
+                document.getElementById("tempVal").textContent = "--.- °C";
+                document.getElementById("humVal").textContent = "--.- %";
+                document.getElementById("lastUpdate").textContent = "--";
+            } else if (s.online) {
+                badge.textContent = "Online - Aggiornato";
+                badge.className = "status-badge status-ok";
+                document.getElementById("tempVal").textContent = s.temperature.toFixed(1) + " °C";
+                document.getElementById("humVal").textContent = s.humidity.toFixed(1) + " %";
+                document.getElementById("lastUpdate").textContent = s.ageSeconds + " sec fa";
+            } else {
+                badge.textContent = "Offline - Segnale perso";
+                badge.className = "status-badge status-offline";
+                document.getElementById("tempVal").textContent = s.temperature.toFixed(1) + " °C";
+                document.getElementById("humVal").textContent = s.humidity.toFixed(1) + " %";
+                document.getElementById("lastUpdate").textContent = s.ageSeconds + " sec fa";
             }
 
-            context.fillStyle = "#64748b";
-            context.font = "11px Arial";
-            context.textAlign = "left";
+            const temps = s.history.map(h => h.temperature);
+            const hums = s.history.map(h => h.humidity);
 
-            context.fillText(
-                "Piu vecchio",
-                margin.left,
-                height - 8
-            );
-
-            context.textAlign = "right";
-
-            context.fillText(
-                "Piu recente",
-                margin.left + graphWidth,
-                height - 8
-            );
+            drawChart("tempChart", temps, "#ef4444", "°", null, null);
+            drawChart("humChart", hums, "#0284c7", "%", 0, 100);
         }
 
-        function redrawCharts() {
-            const temperatures =
-                historyData.map(
-                    sample => sample.temperature
-                );
-
-            const humidities =
-                historyData.map(
-                    sample => sample.humidity
-                );
-
-            drawChart(
-                "temperatureChart",
-                temperatures,
-                "#dc2626",
-                "°",
-                null,
-                null
-            );
-
-            drawChart(
-                "humidityChart",
-                humidities,
-                "#0284c7",
-                "%",
-                0,
-                100
-            );
-        }
-
-        async function updateCurrentData() {
+        async function fetchData() {
             try {
-                const response =
-                    await fetch(
-                        "/api/current",
-                        { cache: "no-store" }
-                    );
-
-                if (!response.ok) {
-                    throw new Error("Errore HTTP");
+                const res = await fetch("/api/data", { cache: "no-store" });
+                if (!res.ok) return;
+                const data = await res.json();
+                
+                const prevLength = sensorsData.length;
+                sensorsData = data;
+                
+                if (prevLength !== sensorsData.length) {
+                    renderTabs();
                 }
-
-                const data =
-                    await response.json();
-
-                document.getElementById(
-                    "packets"
-                ).textContent = data.packets;
-
-                document.getElementById(
-                    "samples"
-                ).textContent = data.samples;
-
-                const status =
-                    document.getElementById("status");
-
-                if (data.valid) {
-                    document.getElementById(
-                        "temperature"
-                    ).textContent =
-                        data.temperature.toFixed(1) +
-                        " °C";
-
-                    document.getElementById(
-                        "humidity"
-                    ).textContent =
-                        data.humidity.toFixed(1) +
-                        " %";
-
-                    document.getElementById(
-                        "sender"
-                    ).textContent =
-                        data.sender;
-
-                    document.getElementById(
-                        "lastUpdate"
-                    ).textContent =
-                        data.ageSeconds +
-                        " secondi fa";
-
-                    if (data.online) {
-                        status.textContent =
-                            "Dati ricevuti";
-
-                        status.className =
-                            "status-ok";
-                    } else {
-                        status.textContent =
-                            "Trasmettitore non aggiornato";
-
-                        status.className =
-                            "status-warning";
-                    }
-                }
-            }
-            catch (error) {
-                const status =
-                    document.getElementById("status");
-
-                status.textContent =
-                    "Errore di comunicazione";
-
-                status.className =
-                    "status-warning";
+                updateDisplay();
+            } catch (e) {
+                console.error("Errore fetch:", e);
             }
         }
 
-        async function updateHistory() {
-            try {
-                const response =
-                    await fetch(
-                        "/api/history",
-                        { cache: "no-store" }
-                    );
-
-                if (!response.ok) {
-                    throw new Error("Errore HTTP");
-                }
-
-                historyData =
-                    await response.json();
-
-                redrawCharts();
-            }
-            catch (error) {
-                console.log(
-                    "Errore storico:",
-                    error
-                );
-            }
-        }
-
-        async function updatePage() {
-            await Promise.all([
-                updateCurrentData(),
-                updateHistory()
-            ]);
-        }
-
-        window.addEventListener(
-            "resize",
-            redrawCharts
-        );
-
-        updatePage();
-
-        setInterval(
-            updatePage,
-            2000
-        );
+        window.addEventListener("resize", updateDisplay);
+        fetchData();
+        setInterval(fetchData, 2000);
     </script>
 </body>
 </html>
 )rawliteral";
 
 // ============================================================
-// FUNZIONI DI SUPPORTO
+// FUNZIONI SUPPORTO
 // ============================================================
 
-void formatMacAddress(
-    const uint8_t *mac,
-    char *destination,
-    size_t destinationSize)
+void formatMacAddress(const uint8_t *mac, char *dest, size_t destSize)
 {
-    snprintf(
-        destination,
-        destinationSize,
-        "%02X:%02X:%02X:%02X:%02X:%02X",
-        mac[0],
-        mac[1],
-        mac[2],
-        mac[3],
-        mac[4],
-        mac[5]);
+    snprintf(dest, destSize, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// ============================================================
-// GESTIONE BUFFER CIRCOLARE
-// ============================================================
-
-void addHistorySample(
-    float temperature,
-    float humidity)
+int findOrRegisterSensor(const uint8_t *mac, const char *incomingName)
 {
-    uint16_t writeIndex;
-
-    if (historyCount < HISTORY_SIZE)
+    for (uint8_t i = 0; i < activeSensorCount; i++)
     {
-        writeIndex =
-            (historyStart + historyCount)
-            % HISTORY_SIZE;
+        if (memcmp(sensors[i].mac, mac, 6) == 0)
+        {
+            // Aggiorna il nome se è stato modificato sul trasmettitore
+            if (incomingName && strlen(incomingName) > 0)
+            {
+                strncpy(sensors[i].name, incomingName, sizeof(sensors[i].name) - 1);
+                sensors[i].name[sizeof(sensors[i].name) - 1] = '\0';
+            }
+            return i;
+        }
+    }
 
-        historyCount++;
+    if (activeSensorCount >= MAX_SENSORS) return -1;
+
+    uint8_t idx = activeSensorCount++;
+    memcpy(sensors[idx].mac, mac, 6);
+    formatMacAddress(mac, sensors[idx].macStr, sizeof(sensors[idx].macStr));
+
+    if (incomingName && strlen(incomingName) > 0)
+    {
+        strncpy(sensors[idx].name, incomingName, sizeof(sensors[idx].name) - 1);
+        sensors[idx].name[sizeof(sensors[idx].name) - 1] = '\0';
     }
     else
     {
-        writeIndex = historyStart;
-
-        historyStart =
-            (historyStart + 1)
-            % HISTORY_SIZE;
+        snprintf(sensors[idx].name, sizeof(sensors[idx].name), "Sensore %02X%02X", mac[4], mac[5]);
     }
 
-    historyBuffer[writeIndex].temperature =
-        temperature;
-
-    historyBuffer[writeIndex].humidity =
-        humidity;
-
-    historyBuffer[writeIndex].timestampSeconds =
-        millis() / 1000;
+    return idx;
 }
 
-// Restituisce l'indice fisico corrispondente
-// alla posizione cronologica richiesta.
-uint16_t getHistoryIndex(
-    uint16_t chronologicalPosition)
+void addHistorySample(SensorNode &sensor, float temp, float hum)
 {
-    return
-        (historyStart + chronologicalPosition)
-        % HISTORY_SIZE;
+    uint16_t writeIdx;
+    if (sensor.historyCount < HISTORY_SIZE)
+    {
+        writeIdx = (sensor.historyStart + sensor.historyCount) % HISTORY_SIZE;
+        sensor.historyCount++;
+    }
+    else
+    {
+        writeIdx = sensor.historyStart;
+        sensor.historyStart = (sensor.historyStart + 1) % HISTORY_SIZE;
+    }
+
+    sensor.historyBuffer[writeIdx].temperature = temp;
+    sensor.historyBuffer[writeIdx].humidity = hum;
+    sensor.historyBuffer[writeIdx].timestampSeconds = millis() / 1000;
 }
 
 // ============================================================
 // CALLBACK ESP-NOW
-//
-// La callback resta breve e non usa String, Serial o server web.
 // ============================================================
 
-void onDataReceived(
-    uint8_t *mac,
-    uint8_t *incomingData,
-    uint8_t length)
+void onDataReceived(uint8_t *mac, uint8_t *incomingData, uint8_t length)
 {
-    if (
-        mac == nullptr ||
-        incomingData == nullptr ||
-        length != sizeof(SensorData)
-    )
-    {
-        return;
-    }
+    if (!mac || !incomingData || length != sizeof(SensorData)) return;
 
-    memcpy(
-        &pendingData,
-        incomingData,
-        sizeof(pendingData));
-
-    memcpy(
-        pendingSenderMac,
-        mac,
-        sizeof(pendingSenderMac));
-
+    memcpy(&pendingData, incomingData, sizeof(pendingData));
+    memcpy(pendingSenderMac, mac, sizeof(pendingSenderMac));
     pendingPacketAvailable = true;
 }
 
-// ============================================================
-// ELABORAZIONE PACCHETTO NEL LOOP
-// ============================================================
-
 void processPendingPacket()
 {
-    if (!pendingPacketAvailable)
-    {
-        return;
-    }
+    if (!pendingPacketAvailable) return;
 
     noInterrupts();
-
-    SensorData localData =
-        pendingData;
-
-    uint8_t localSenderMac[6];
-
-    memcpy(
-        localSenderMac,
-        pendingSenderMac,
-        sizeof(localSenderMac));
-
+    SensorData localData = pendingData;
+    uint8_t localMac[6];
+    memcpy(localMac, pendingSenderMac, 6);
     pendingPacketAvailable = false;
-
     interrupts();
 
-    if (
-        isnan(localData.temperature) ||
-        isnan(localData.humidity)
-    )
-    {
-        Serial.println(
-            "Pacchetto ignorato: valori non validi");
+    if (isnan(localData.temperature) || isnan(localData.humidity)) return;
 
-        return;
-    }
+    int idx = findOrRegisterSensor(localMac, localData.sensorName);
+    if (idx < 0) return;
 
-    receivedData = localData;
+    SensorNode &s = sensors[idx];
+    s.currentData = localData;
+    s.hasData = true;
+    s.packetCount++;
+    s.lastUpdateMs = millis();
 
-    formatMacAddress(
-        localSenderMac,
-        senderMacString,
-        sizeof(senderMacString));
-
-    hasReceivedData = true;
-    packetCounter++;
-    lastUpdateMs = millis();
-
-    addHistorySample(
-        receivedData.temperature,
-        receivedData.humidity);
-
-    Serial.println(
-        "--------------------------------");
-
-    Serial.print("Da: ");
-    Serial.println(senderMacString);
-
-    Serial.printf(
-        "Temperatura: %.1f C\n",
-        receivedData.temperature);
-
-    Serial.printf(
-        "Umidita': %.1f %%\n",
-        receivedData.humidity);
-
-    Serial.printf(
-        "Pacchetti ricevuti: %lu\n",
-        static_cast<unsigned long>(
-            packetCounter));
-
-    Serial.printf(
-        "Campioni nello storico: %u/%u\n",
-        historyCount,
-        HISTORY_SIZE);
+    addHistorySample(s, localData.temperature, localData.humidity);
 }
 
 // ============================================================
-// PAGINA WEB PRINCIPALE
+// ENDPOINT API
 // ============================================================
+
+void handleDataApi()
+{
+    String json;
+    json.reserve(2048);
+    json += "[";
+
+    uint32_t now = millis();
+
+    for (uint8_t i = 0; i < activeSensorCount; i++)
+    {
+        if (i > 0) json += ",";
+        SensorNode &s = sensors[i];
+        uint32_t ageMs = s.hasData ? (now - s.lastUpdateMs) : 0;
+        bool online = s.hasData && (ageMs <= OFFLINE_TIMEOUT_MS);
+
+        json += "{";
+        json += "\"name\":\"" + String(s.name) + "\",";
+        json += "\"mac\":\"" + String(s.macStr) + "\",";
+        json += "\"valid\":" + String(s.hasData ? "true" : "false") + ",";
+        json += "\"online\":" + String(online ? "true" : "false") + ",";
+        json += "\"temperature\":" + String(s.currentData.temperature, 1) + ",";
+        json += "\"humidity\":" + String(s.currentData.humidity, 1) + ",";
+        json += "\"packets\":" + String(s.packetCount) + ",";
+        json += "\"samples\":" + String(s.historyCount) + ",";
+        json += "\"ageSeconds\":" + String(ageMs / 1000) + ",";
+        json += "\"history\":[";
+
+        for (uint16_t h = 0; h < s.historyCount; h++)
+        {
+            if (h > 0) json += ",";
+            uint16_t idx = (s.historyStart + h) % HISTORY_SIZE;
+            json += "{\"temperature\":" + String(s.historyBuffer[idx].temperature, 1) + ",";
+            json += "\"humidity\":" + String(s.historyBuffer[idx].humidity, 1) + "}";
+        }
+        json += "]}";
+    }
+
+    json += "]";
+    server.sendHeader(F("Cache-Control"), F("no-store"));
+    server.send(200, "application/json; charset=utf-8", json);
+}
 
 void handleRoot()
 {
-    server.send_P(
-        200,
-        "text/html; charset=utf-8",
-        INDEX_HTML);
+    server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
 // ============================================================
-// API DATI CORRENTI
-// ============================================================
-
-void handleCurrentData()
-{
-    uint32_t ageMs = 0;
-
-    if (hasReceivedData)
-    {
-        ageMs =
-            millis() - lastUpdateMs;
-    }
-
-    const bool senderOnline =
-        hasReceivedData &&
-        ageMs <= OFFLINE_TIMEOUT_MS;
-
-    String json;
-    json.reserve(240);
-
-    json += F("{");
-
-    json += F("\"valid\":");
-    json +=
-        hasReceivedData
-            ? F("true")
-            : F("false");
-
-    json += F(",\"online\":");
-    json +=
-        senderOnline
-            ? F("true")
-            : F("false");
-
-    json += F(",\"temperature\":");
-    json += String(
-        receivedData.temperature,
-        1);
-
-    json += F(",\"humidity\":");
-    json += String(
-        receivedData.humidity,
-        1);
-
-    json += F(",\"sender\":\"");
-
-    if (hasReceivedData)
-    {
-        json += senderMacString;
-    }
-    else
-    {
-        json += F("--");
-    }
-
-    json += F("\"");
-
-    json += F(",\"packets\":");
-    json += String(packetCounter);
-
-    json += F(",\"samples\":");
-    json += String(historyCount);
-
-    json += F(",\"ageSeconds\":");
-    json += String(ageMs / 1000);
-
-    json += F("}");
-
-    server.sendHeader(
-        F("Cache-Control"),
-        F("no-store"));
-
-    server.send(
-        200,
-        "application/json; charset=utf-8",
-        json);
-}
-
-// ============================================================
-// API STORICO DEI 100 CAMPIONI
-// ============================================================
-
-void handleHistory()
-{
-    String json;
-
-    // Riserva memoria per ridurre riallocazioni e frammentazione.
-    json.reserve(
-        2 + historyCount * 65);
-
-    json += F("[");
-
-    for (
-        uint16_t position = 0;
-        position < historyCount;
-        position++
-    )
-    {
-        if (position > 0)
-        {
-            json += F(",");
-        }
-
-        const uint16_t index =
-            getHistoryIndex(position);
-
-        const HistorySample &sample =
-            historyBuffer[index];
-
-        json += F("{\"temperature\":");
-        json += String(
-            sample.temperature,
-            1);
-
-        json += F(",\"humidity\":");
-        json += String(
-            sample.humidity,
-            1);
-
-        json += F(",\"time\":");
-        json += String(
-            sample.timestampSeconds);
-
-        json += F("}");
-    }
-
-    json += F("]");
-
-    server.sendHeader(
-        F("Cache-Control"),
-        F("no-store"));
-
-    server.send(
-        200,
-        "application/json; charset=utf-8",
-        json);
-}
-
-// ============================================================
-// ROUTE NON TROVATA
-// ============================================================
-
-void handleNotFound()
-{
-    server.send(
-        404,
-        "text/plain; charset=utf-8",
-        "Pagina non trovata");
-}
-
-// ============================================================
-// AVVIO ACCESS POINT
+// INIZIALIZZAZIONE & SETUP
 // ============================================================
 
 bool startAccessPoint()
@@ -1044,148 +531,40 @@ bool startAccessPoint()
     WiFi.mode(WIFI_AP_STA);
     WiFi.disconnect();
 
-    delay(100);
+    uint32_t startMs = millis();
+    while (millis() - startMs < 100) { yield(); }
 
-    const bool started =
-        WiFi.softAP(
-            AP_SSID,
-            AP_PASSWORD,
-            WIFI_CHANNEL);
-
-    if (!started)
-    {
-        return false;
-    }
-
-    Serial.println();
-    Serial.println("Access Point creato");
-
-    Serial.print("SSID: ");
-    Serial.println(AP_SSID);
-
-    Serial.print("Canale: ");
-    Serial.println(WIFI_CHANNEL);
-
-    Serial.print("IP: ");
-    Serial.println(WiFi.softAPIP());
-
-    Serial.print("MAC Station ESP-NOW: ");
-    Serial.println(WiFi.macAddress());
-
-    Serial.print("MAC Access Point: ");
-    Serial.println(WiFi.softAPmacAddress());
-
-    return true;
+    return WiFi.softAP(AP_SSID, AP_PASSWORD, WIFI_CHANNEL);
 }
-
-// ============================================================
-// AVVIO ESP-NOW
-// ============================================================
 
 bool startEspNow()
 {
-    if (esp_now_init() != 0)
-    {
-        return false;
-    }
-
-    esp_now_set_self_role(
-        ESP_NOW_ROLE_SLAVE);
-
-    esp_now_register_recv_cb(
-        onDataReceived);
-
-    Serial.println(
-        "ESP-NOW inizializzato");
-
-    Serial.println(
-        "Ricevitore pronto");
-
+    if (esp_now_init() != 0) return false;
+    esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+    esp_now_register_recv_cb(onDataReceived);
     return true;
 }
-
-// ============================================================
-// AVVIO SERVER WEB
-// ============================================================
-
-void startWebServer()
-{
-    server.on(
-        "/",
-        HTTP_GET,
-        handleRoot);
-
-    server.on(
-        "/api/current",
-        HTTP_GET,
-        handleCurrentData);
-
-    server.on(
-        "/api/history",
-        HTTP_GET,
-        handleHistory);
-
-    server.onNotFound(
-        handleNotFound);
-
-    server.begin();
-
-    Serial.println(
-        "Server web avviato");
-
-    Serial.println(
-        "Pagina: http://192.168.4.1");
-}
-
-// ============================================================
-// SETUP
-// ============================================================
 
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    
+    uint32_t initStart = millis();
+    while (millis() - initStart < 1000) { yield(); }
 
-    Serial.println();
-    Serial.println(
-        "================================");
+    Serial.println("\n=== ESP-NOW MULTI-RECEIVER DYNAMIC ===");
 
-    Serial.println(
-        "ESP-NOW WEB RECEIVER");
-
-    Serial.println(
-        "Storico: 100 campioni");
-
-    Serial.println(
-        "================================");
-
-    if (!startAccessPoint())
+    if (!startAccessPoint() || !startEspNow())
     {
-        Serial.println(
-            "ERRORE: Access Point non creato");
-
-        while (true)
-        {
-            delay(1000);
-        }
+        Serial.println("Errore Inizializzazione Hardware!");
+        while (true) { yield(); }
     }
 
-    if (!startEspNow())
-    {
-        Serial.println(
-            "ERRORE: inizializzazione ESP-NOW");
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/api/data", HTTP_GET, handleDataApi);
+    server.begin();
 
-        while (true)
-        {
-            delay(1000);
-        }
-    }
-
-    startWebServer();
-
-    Serial.println();
-    Serial.println(
-        "Configurazione completata");
+    Serial.println("Ricevitore Pronto!");
 }
 
 // ============================================================
@@ -1195,8 +574,6 @@ void setup()
 void loop()
 {
     processPendingPacket();
-
     server.handleClient();
-
     yield();
 }
