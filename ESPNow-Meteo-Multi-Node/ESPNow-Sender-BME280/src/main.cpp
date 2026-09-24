@@ -9,6 +9,7 @@ constexpr uint32_t SLEEP_SECONDS = 300;   // 5 minuti
 constexpr uint8_t WIFI_CHANNEL = 1;
 
 uint8_t receiverMac[] = {0x60, 0x01, 0x94, 0x74, 0x62, 0x05};
+uint32_t bootStartMillis = 0;
 
 struct __attribute__((packed)) SensorData {
     char location[16];
@@ -29,6 +30,9 @@ void onDataSent(uint8_t *mac_addr, uint8_t status) {
 }
 
 void goToSleep() {
+    uint32_t elapsed = millis() - bootStartMillis;
+    Serial.printf("Tempo totale attivo: %lu ms (%.3f s)\n",(unsigned long)elapsed,elapsed / 1000.0);    
+    
     Serial.printf("Deep Sleep %lu s...\n", (unsigned long)SLEEP_SECONDS);
     Serial.flush();
     // RF_DISABLED accorcia i tempi del boot successivo, ma con ESP-NOW RF viene riattivato al setup
@@ -78,12 +82,24 @@ bool readAndSendData() {
 }
 
 void setup() {
+    bootStartMillis = millis();
+
     Serial.begin(115200);
     // Rimosso il delay(1000) iniziale per velocizzare il boot
 
     Wire.begin(D2, D1);
+    delay(10); // Piccolo ritardo per stabilizzare la comunicazione I2C
+    Wire.setClock(100000);
+    Wire.setClockStretchLimit(150000);
+    Wire.setTimeout(1000);
 
-    bool found = bme.begin(0x76) || bme.begin(0x77);
+
+    bool found = bme.begin(0x76); 
+    if (!found) 
+    {
+        found = bme.begin(0x77);
+    }
+    delay(100); // Piccolo ritardo per stabilizzare la lettura del sensore
     if (!found) {
         Serial.println(F("BME280 non trovato"));
         goToSleep();
