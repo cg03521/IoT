@@ -136,7 +136,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         name="viewport"
         content="width=device-width, initial-scale=1.0">
 
-    <title>Stazione Meteo ESP-NOW</title>
+    <title>Stazione Meteo</title>
 
     <style>
         * {
@@ -320,7 +320,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
 <div class="container">
     <header>
-        <h1>Stazione Meteo ESP-NOW</h1>
+        <h1>Stazione Meteo</h1>
         <p class="subtitle">Ricevitore multi-nodo</p>
     </header>
 
@@ -1615,6 +1615,8 @@ bool startAccessPoint()
 
     delay(100);
 
+    WiFi.setOutputPower(20.5);
+    
     const bool started =
         WiFi.softAP(
             AP_SSID,
