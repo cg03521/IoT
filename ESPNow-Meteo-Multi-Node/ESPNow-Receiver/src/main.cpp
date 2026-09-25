@@ -14,7 +14,7 @@ constexpr char AP_PASSWORD[] = "Meteo2026";
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint16_t WEB_SERVER_PORT = 80;
 
-// Il nuovo sender trasmette ogni 5 minuti.
+// Il sender trasmette ogni 5 minuti.
 // Sette minuti consentono un certo margine operativo.
 constexpr uint32_t OFFLINE_TIMEOUT_MS = 420000UL;
 
@@ -62,6 +62,9 @@ struct HistorySample
     float temperature;
     float humidity;
     float pressure;
+
+    // Tempo relativo al boot del receiver.
+    // NON è un timestamp assoluto.
     uint32_t timestampSeconds;
 };
 
@@ -123,8 +126,10 @@ uint8_t pendingSenderMac[6]{};
 //   /api/sensors
 //   /api/history?id=N
 //
-// Questo evita di costruire un unico JSON molto grande,
-// riducendo l'uso e la frammentazione della heap ESP8266.
+// Il tempo visualizzato nei grafici è RELATIVO:
+//   -4h  -3h  -2h  -1h  ora
+//
+// Non viene utilizzato alcun RTC.
 // ============================================================
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -132,6 +137,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <html lang="it">
 <head>
     <meta charset="UTF-8">
+
     <meta
         name="viewport"
         content="width=device-width, initial-scale=1.0">
@@ -319,6 +325,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
 <body>
 <div class="container">
+
     <header>
         <h1>Stazione Meteo</h1>
         <p class="subtitle">Ricevitore multi-nodo</p>
@@ -333,6 +340,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div id="warning" class="warning"></div>
 
     <div class="cards">
+
         <div class="card">
             <div class="card-title">Temperatura</div>
             <div id="temp" class="card-value">--.- °C</div>
@@ -347,6 +355,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <div class="card-title">Pressione assoluta</div>
             <div id="pressure" class="card-value">--.- hPa</div>
         </div>
+
     </div>
 
     <button
@@ -357,6 +366,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </button>
 
     <div id="forecastPanel" class="panel forecast">
+
         <div id="forecastTitle" class="forecast-title">
             Previsione non disponibile
         </div>
@@ -365,6 +375,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
              class="forecast-description"></div>
 
         <div class="details">
+
             <strong>Trend pressione:</strong>
             <span id="forecastTrend">--</span>
             <br>
@@ -375,6 +386,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
             <strong>Campioni barometrici:</strong>
             <span id="forecastSamples">0</span>
+
         </div>
     </div>
 
@@ -394,6 +406,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="panel details">
+
         <strong>Nodo:</strong>
         <span id="nodeName">--</span>
         <br>
@@ -416,153 +429,415 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
         <strong>Ultimo aggiornamento:</strong>
         <span id="age">--</span>
+
     </div>
+
 </div>
 
 <script>
+
     let sensors = [];
     let selectedIndex = 0;
     let selectedHistory = [];
-    let lastHistorySensor = -1;
 
-    function drawChart(canvasId, values, color, unit, fixedMin, fixedMax) {
-        const canvas = document.getElementById(canvasId);
-        const ratio = window.devicePixelRatio || 1;
-        const rect = canvas.getBoundingClientRect();
-        const width = Math.max(280, rect.width);
-        const height = Math.max(180, rect.height);
+    // ========================================================
+    // GRAFICO
+    //
+    // L'asse X rappresenta il tempo relativo all'ultimo
+    // campione ricevuto:
+    //
+    //     -4h  -3h  -2h  -1h  ora
+    //
+    // Non viene utilizzato alcun orologio reale.
+    // ========================================================
 
-        canvas.width = width * ratio;
-        canvas.height = height * ratio;
+    function drawChart(
+        canvasId,
+        samples,
+        color,
+        unit,
+        fixedMin,
+        fixedMax)
+    {
+        const canvas =
+            document.getElementById(canvasId);
 
-        const ctx = canvas.getContext("2d");
-        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-        ctx.clearRect(0, 0, width, height);
+        const ratio =
+            window.devicePixelRatio || 1;
 
-        if (!values.length) {
+        const rect =
+            canvas.getBoundingClientRect();
+
+        const width =
+            Math.max(280, rect.width);
+
+        const height =
+            Math.max(180, rect.height);
+
+        canvas.width =
+            width * ratio;
+
+        canvas.height =
+            height * ratio;
+
+        const ctx =
+            canvas.getContext("2d");
+
+        ctx.setTransform(
+            ratio,
+            0,
+            0,
+            ratio,
+            0,
+            0);
+
+        ctx.clearRect(
+            0,
+            0,
+            width,
+            height);
+
+        const valid =
+            samples.filter(
+                s =>
+                    Number.isFinite(s.value) &&
+                    Number.isFinite(s.time)
+            );
+
+        if (!valid.length)
+        {
             ctx.fillStyle = "#94a3b8";
             ctx.font = "14px sans-serif";
             ctx.textAlign = "center";
-            ctx.fillText("Nessun dato disponibile", width / 2, height / 2);
+
+            ctx.fillText(
+                "Nessun dato disponibile",
+                width / 2,
+                height / 2);
+
             return;
         }
 
-        const margin = {top: 15, right: 12, bottom: 25, left: 49};
-        const graphWidth = width - margin.left - margin.right;
-        const graphHeight = height - margin.top - margin.bottom;
+        const margin = {
+            top: 15,
+            right: 12,
+            bottom: 34,
+            left: 49
+        };
 
-        let min = fixedMin !== null
-            ? fixedMin
-            : Math.min(...values) - 0.5;
+        const graphWidth =
+            width -
+            margin.left -
+            margin.right;
 
-        let max = fixedMax !== null
-            ? fixedMax
-            : Math.max(...values) + 0.5;
+        const graphHeight =
+            height -
+            margin.top -
+            margin.bottom;
 
-        if (max <= min) {
+        const values =
+            valid.map(
+                s => s.value);
+
+        let min =
+            fixedMin !== null
+                ? fixedMin
+                : Math.min(...values) - 0.5;
+
+        let max =
+            fixedMax !== null
+                ? fixedMax
+                : Math.max(...values) + 0.5;
+
+        if (max <= min)
+        {
             max = min + 1;
         }
 
-        const range = max - min;
+        const range =
+            max - min;
+
+        // ====================================================
+        // TEMPO RELATIVO
+        //
+        // latestTime = "ora"
+        //
+        // Ogni campione viene posizionato in funzione di
+        // quante ore prima dell'ultimo campione è stato ricevuto.
+        // ====================================================
+
+        const latestTime =
+            valid[valid.length - 1].time;
+
+        const oldestTime =
+            valid[0].time;
+
+        const timeSpan =
+            Math.max(
+                1,
+                latestTime - oldestTime);
+
+        // Tempo massimo visualizzato: 4 ore.
+        const visibleSeconds =
+            4 * 3600;
+
+        // Se abbiamo meno di 4 ore di dati, utilizziamo
+        // tutto lo storico disponibile.
+        const actualSpan =
+            Math.min(
+                visibleSeconds,
+                timeSpan);
+
+        const startTime =
+            latestTime - actualSpan;
+
+        // ====================================================
+        // GRIGLIA Y
+        // ====================================================
 
         ctx.strokeStyle = "#e2e8f0";
         ctx.fillStyle = "#64748b";
         ctx.font = "11px sans-serif";
 
-        for (let line = 0; line <= 4; line++) {
-            const y = margin.top + graphHeight * line / 4;
-            const value = max - range * line / 4;
+        for (
+            let line = 0;
+            line <= 4;
+            line++)
+        {
+            const y =
+                margin.top +
+                graphHeight * line / 4;
+
+            const value =
+                max -
+                range * line / 4;
 
             ctx.beginPath();
-            ctx.moveTo(margin.left, y);
-            ctx.lineTo(margin.left + graphWidth, y);
+
+            ctx.moveTo(
+                margin.left,
+                y);
+
+            ctx.lineTo(
+                margin.left + graphWidth,
+                y);
+
             ctx.stroke();
 
             ctx.textAlign = "right";
+
             ctx.fillText(
                 value.toFixed(1) + unit,
                 margin.left - 5,
-                y + 4
-            );
+                y + 4);
         }
+
+        // ====================================================
+        // ASSE X
+        //
+        // Esempio:
+        //
+        // -4h   -3h   -2h   -1h   ora
+        //
+        // Se sono disponibili meno di 4 ore, vengono mostrate
+        // solamente le ore realmente presenti.
+        // ====================================================
+
+        ctx.font = "10px sans-serif";
+
+        const hoursAvailable =
+            actualSpan / 3600;
+
+        const maxTick =
+            Math.floor(hoursAvailable);
+
+        for (
+            let hoursAgo = maxTick;
+            hoursAgo >= 0;
+            hoursAgo--)
+        {
+            const tickTime =
+                latestTime -
+                hoursAgo * 3600;
+
+            const fraction =
+                actualSpan === 0
+                    ? 1
+                    : (tickTime - startTime) /
+                      actualSpan;
+
+            const x =
+                margin.left +
+                graphWidth * fraction;
+
+            ctx.strokeStyle =
+                "#e2e8f0";
+
+            ctx.beginPath();
+
+            ctx.moveTo(
+                x,
+                margin.top);
+
+            ctx.lineTo(
+                x,
+                margin.top + graphHeight);
+
+            ctx.stroke();
+
+            ctx.fillStyle =
+                "#64748b";
+
+            if (hoursAgo === 0)
+            {
+                ctx.textAlign = "right";
+
+                ctx.fillText(
+                    "ora",
+                    x,
+                    height - 9);
+            }
+            else
+            {
+                ctx.textAlign = "center";
+
+                ctx.fillText(
+                    "-" + hoursAgo + "h",
+                    x,
+                    height - 9);
+            }
+        }
+
+        // ====================================================
+        // CURVA
+        // ====================================================
 
         ctx.strokeStyle = color;
         ctx.lineWidth = 2.2;
         ctx.beginPath();
 
-        values.forEach((value, index) => {
-            const x = values.length === 1
-                ? margin.left + graphWidth / 2
-                : margin.left +
-                  graphWidth * index / (values.length - 1);
+        let firstPoint = true;
 
-            const y = margin.top +
-                graphHeight * (max - value) / range;
+        valid.forEach(
+            sample =>
+            {
+                if (sample.time < startTime)
+                {
+                    return;
+                }
 
-            if (index === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
-            }
-        });
+                const x =
+                    margin.left +
+                    graphWidth *
+                    (sample.time - startTime) /
+                    actualSpan;
+
+                const y =
+                    margin.top +
+                    graphHeight *
+                    (max - sample.value) /
+                    range;
+
+                if (firstPoint)
+                {
+                    ctx.moveTo(x, y);
+                    firstPoint = false;
+                }
+                else
+                {
+                    ctx.lineTo(x, y);
+                }
+            });
 
         ctx.stroke();
     }
 
-    function renderTabs() {
-        const tabs = document.getElementById("tabs");
+    // ========================================================
+    // TAB SENSORI
+    // ========================================================
+
+    function renderTabs()
+    {
+        const tabs =
+            document.getElementById("tabs");
+
         tabs.innerHTML = "";
 
-        sensors.forEach((sensor, index) => {
-            const button = document.createElement("button");
+        sensors.forEach(
+            (sensor, index) =>
+            {
+                const button =
+                    document.createElement("button");
 
-            button.className =
-                "tab-btn " +
-                (index === selectedIndex ? "active" : "");
+                button.className =
+                    "tab-btn " +
+                    (
+                        index === selectedIndex
+                            ? "active"
+                            : ""
+                    );
 
-            button.textContent = sensor.name;
+                button.textContent =
+                    sensor.name;
 
-            button.onclick = async () => {
-                selectedIndex = index;
-                lastHistorySensor = -1;
-                renderTabs();
-                await fetchHistory();
-                updateDisplay();
-            };
+                button.onclick =
+                    async () =>
+                    {
+                        selectedIndex = index;
 
-            tabs.appendChild(button);
-        });
+                        renderTabs();
+
+                        await fetchHistory();
+
+                        updateDisplay();
+                    };
+
+                tabs.appendChild(button);
+            });
     }
 
-    async function fetchHistory() {
-        if (!sensors.length) {
+    // ========================================================
+    // STORICO
+    // ========================================================
+
+    async function fetchHistory()
+    {
+        if (!sensors.length)
+        {
             return;
         }
 
-        if (lastHistorySensor === selectedIndex) {
-            return;
-        }
+        const response =
+            await fetch(
+                "/api/history?id=" +
+                selectedIndex,
+                {
+                    cache: "no-store"
+                });
 
-        const response = await fetch(
-            "/api/history?id=" + selectedIndex,
-            {cache: "no-store"}
-        );
-
-        if (!response.ok) {
+        if (!response.ok)
+        {
             selectedHistory = [];
             return;
         }
 
-        selectedHistory = await response.json();
-        lastHistorySensor = selectedIndex;
+        selectedHistory =
+            await response.json();
     }
 
-    function updateDisplay() {
-        if (!sensors.length) {
+    // ========================================================
+    // DISPLAY
+    // ========================================================
+
+    function updateDisplay()
+    {
+        if (!sensors.length)
+        {
             return;
         }
 
-        const sensor = sensors[selectedIndex];
+        const sensor =
+            sensors[selectedIndex];
 
         document.getElementById("nodeName").textContent =
             sensor.name;
@@ -599,44 +874,101 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 ? sensor.pressure.toFixed(1) + " hPa"
                 : "Non disponibile";
 
-        const status = document.getElementById("status");
+        const status =
+            document.getElementById("status");
 
-        if (!sensor.valid) {
-            status.textContent = "In attesa dei dati";
-            status.className = "status waiting";
-        } else if (sensor.online) {
-            status.textContent = "Online - Aggiornato";
-            status.className = "status ok";
-        } else {
-            status.textContent = "Offline - Nessun dato recente";
-            status.className = "status offline";
+        if (!sensor.valid)
+        {
+            status.textContent =
+                "In attesa dei dati";
+
+            status.className =
+                "status waiting";
+        }
+        else if (sensor.online)
+        {
+            status.textContent =
+                "Online - Aggiornato";
+
+            status.className =
+                "status ok";
+        }
+        else
+        {
+            status.textContent =
+                "Offline - Nessun dato recente";
+
+            status.className =
+                "status offline";
         }
 
-        const warning = document.getElementById("warning");
+        // ====================================================
+        // WARNING
+        // ====================================================
 
-        if (sensor.warning) {
-            warning.style.display = "block";
-            warning.textContent = "Attenzione: " + sensor.warningText;
-        } else {
-            warning.style.display = "none";
+        const warning =
+            document.getElementById("warning");
+
+        if (sensor.warning)
+        {
+            warning.style.display =
+                "block";
+
+            warning.textContent =
+                "Attenzione: " +
+                sensor.warningText;
         }
+        else
+        {
+            warning.style.display =
+                "none";
+        }
+
+        // ====================================================
+        // PREVISIONE
+        // ====================================================
 
         document.getElementById("forecastButton").style.display =
-            sensor.hasPressure ? "inline-block" : "none";
+            sensor.hasPressure
+                ? "inline-block"
+                : "none";
 
         document.getElementById("pressureChartPanel").style.display =
-            sensor.hasPressure ? "block" : "none";
+            sensor.hasPressure
+                ? "block"
+                : "none";
+
+        // ====================================================
+        // DATI GRAFICI
+        // ====================================================
 
         const temperatures =
-            selectedHistory.map(item => item.temperature);
+            selectedHistory.map(
+                item =>
+                ({
+                    value: item.temperature,
+                    time: item.time
+                }));
 
         const humidities =
-            selectedHistory.map(item => item.humidity);
+            selectedHistory.map(
+                item =>
+                ({
+                    value: item.humidity,
+                    time: item.time
+                }));
 
         const pressures =
             selectedHistory
-                .filter(item => item.pressure > 0)
-                .map(item => item.pressure);
+                .filter(
+                    item =>
+                        item.pressure > 0)
+                .map(
+                    item =>
+                    ({
+                        value: item.pressure,
+                        time: item.time
+                    }));
 
         drawChart(
             "tempChart",
@@ -644,8 +976,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             "#ef4444",
             "°",
             null,
-            null
-        );
+            null);
 
         drawChart(
             "humChart",
@@ -653,48 +984,65 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             "#0284c7",
             "%",
             0,
-            100
-        );
+            100);
 
-        if (sensor.hasPressure) {
+        if (sensor.hasPressure)
+        {
             drawChart(
                 "pressureChart",
                 pressures,
                 "#7c3aed",
                 "",
                 null,
-                null
-            );
+                null);
         }
     }
 
-    function showForecast() {
-        if (!sensors.length) {
+    // ========================================================
+    // PREVISIONE
+    // ========================================================
+
+    function showForecast()
+    {
+        if (!sensors.length)
+        {
             return;
         }
 
-        const forecast = sensors[selectedIndex].forecast;
-        const panel = document.getElementById("forecastPanel");
+        const forecast =
+            sensors[selectedIndex].forecast;
 
-        panel.style.display = "block";
+        const panel =
+            document.getElementById(
+                "forecastPanel");
 
-        document.getElementById("forecastTitle").textContent =
-            forecast.title;
+        panel.style.display =
+            "block";
 
-        document.getElementById("forecastDescription").textContent =
-            forecast.description;
+        document.getElementById(
+            "forecastTitle").textContent =
+                forecast.title;
 
-        document.getElementById("forecastTrend").textContent =
+        document.getElementById(
+            "forecastDescription").textContent =
+                forecast.description;
+
+        document.getElementById(
+            "forecastTrend").textContent =
             forecast.available
-                ? forecast.trend.toFixed(2) + " hPa/ora"
+                ? forecast.trend.toFixed(2) +
+                  " hPa/ora"
                 : "--";
 
-        document.getElementById("forecastHours").textContent =
+        document.getElementById(
+            "forecastHours").textContent =
             forecast.available
-                ? forecast.hours.toFixed(1) + " ore"
+                ? forecast.hours.toFixed(1) +
+                  " ore"
                 : "--";
 
-        document.getElementById("forecastSamples").textContent =
+        document.getElementById(
+            "forecastSamples").textContent =
             forecast.samples;
 
         panel.scrollIntoView({
@@ -703,50 +1051,68 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         });
     }
 
-    async function fetchSensors() {
-        try {
-            const response = await fetch(
-                "/api/sensors",
-                {cache: "no-store"}
-            );
+    // ========================================================
+    // API SENSORI
+    // ========================================================
 
-            if (!response.ok) {
+    async function fetchSensors()
+    {
+        try
+        {
+            const response =
+                await fetch(
+                    "/api/sensors",
+                    {
+                        cache: "no-store"
+                    });
+
+            if (!response.ok)
+            {
                 return;
             }
 
-            const previousLength = sensors.length;
-            sensors = await response.json();
+            const previousLength =
+                sensors.length;
 
-            if (selectedIndex >= sensors.length) {
+            sensors =
+                await response.json();
+
+            if (selectedIndex >= sensors.length)
+            {
                 selectedIndex = 0;
             }
 
-            if (previousLength !== sensors.length) {
-                renderTabs();
-                lastHistorySensor = -1;
-            }
-
-            // Ricarica lo storico se è arrivato un nuovo campione.
             if (
-                sensors.length &&
-                selectedHistory.length !== sensors[selectedIndex].samples
-            ) {
-                lastHistorySensor = -1;
+                previousLength !==
+                sensors.length)
+            {
+                renderTabs();
             }
 
-            await fetchHistory();
-            updateDisplay();
+            if (sensors.length)
+            {
+                await fetchHistory();
+                updateDisplay();
+            }
         }
-        catch (error) {
+        catch (error)
+        {
             console.error(error);
         }
     }
 
-    window.addEventListener("resize", updateDisplay);
+    window.addEventListener(
+        "resize",
+        updateDisplay);
 
     fetchSensors();
-    setInterval(fetchSensors, 5000);
+
+    setInterval(
+        fetchSensors,
+        5000);
+
 </script>
+
 </body>
 </html>
 )rawliteral";
@@ -772,21 +1138,25 @@ void formatMacAddress(
         mac[5]);
 }
 
-void jsonEscapeAppend(String &destination, const char *source)
+void jsonEscapeAppend(
+    String &destination,
+    const char *source)
 {
     while (*source)
     {
-        const char character = *source++;
+        const char character =
+            *source++;
 
-        if (character == '"' || character == '\\')
+        if (
+            character == '"' ||
+            character == '\\')
         {
             destination += '\\';
         }
 
         if (
             character != '\r' &&
-            character != '\n'
-        )
+            character != '\n')
         {
             destination += character;
         }
@@ -921,6 +1291,16 @@ void setWarning(
     ] = '\0';
 }
 
+// ============================================================
+// STORICO
+//
+// Il tempo è esclusivamente relativo al boot del receiver.
+//
+// millis() -> secondi.
+//
+// Non esiste più alcun riferimento a data/ora reale.
+// ============================================================
+
 void addHistorySample(
     SensorNode &sensor,
     float temperature,
@@ -932,37 +1312,57 @@ void addHistorySample(
     if (sensor.historyCount < HISTORY_SIZE)
     {
         writeIndex =
-            (sensor.historyStart + sensor.historyCount)
-            % HISTORY_SIZE;
+            (
+                sensor.historyStart +
+                sensor.historyCount
+            ) % HISTORY_SIZE;
 
         sensor.historyCount++;
     }
     else
     {
-        writeIndex = sensor.historyStart;
+        writeIndex =
+            sensor.historyStart;
 
         sensor.historyStart =
-            (sensor.historyStart + 1)
-            % HISTORY_SIZE;
+            (
+                sensor.historyStart + 1
+            ) % HISTORY_SIZE;
     }
 
     HistorySample &sample =
         sensor.historyBuffer[writeIndex];
 
-    sample.temperature = temperature;
-    sample.humidity = humidity;
-    sample.pressure = pressure;
-    sample.timestampSeconds = millis() / 1000UL;
+    sample.temperature =
+        temperature;
+
+    sample.humidity =
+        humidity;
+
+    sample.pressure =
+        pressure;
+
+    // ========================================================
+    // TEMPO RELATIVO
+    //
+    // Il valore rappresenta solamente i secondi trascorsi
+    // dal boot del receiver.
+    // ========================================================
+
+    sample.timestampSeconds =
+        millis() / 1000UL;
 }
 
 // ============================================================
 // CALCOLO PREVISIONE
 //
-// Viene calcolata una regressione lineare:
+// Regressione lineare:
 // pressione = intercetta + pendenza * tempo.
 //
 // La pendenza viene restituita in hPa/ora.
-// È un indicatore sperimentale, non una previsione professionale.
+//
+// Il tempo utilizzato è quello relativo generato da millis().
+// Non serve alcun RTC.
 // ============================================================
 
 ForecastResult calculateForecast(
@@ -988,6 +1388,7 @@ ForecastResult calculateForecast(
     double sumXX = 0.0;
 
     uint16_t validCount = 0;
+
     uint32_t firstTimestamp = 0;
     uint32_t lastTimestamp = 0;
 
@@ -997,8 +1398,10 @@ ForecastResult calculateForecast(
         position++)
     {
         const uint16_t index =
-            (sensor.historyStart + position)
-            % HISTORY_SIZE;
+            (
+                sensor.historyStart +
+                position
+            ) % HISTORY_SIZE;
 
         const HistorySample &sample =
             sensor.historyBuffer[index];
@@ -1029,13 +1432,19 @@ ForecastResult calculateForecast(
 
         sumX += hoursFromFirst;
         sumY += pressure;
-        sumXY += hoursFromFirst * pressure;
-        sumXX += hoursFromFirst * hoursFromFirst;
+        sumXY +=
+            hoursFromFirst *
+            pressure;
+
+        sumXX +=
+            hoursFromFirst *
+            hoursFromFirst;
 
         validCount++;
     }
 
-    result.pressureSamples = validCount;
+    result.pressureSamples =
+        validCount;
 
     if (
         validCount < 6 ||
@@ -1068,8 +1477,10 @@ ForecastResult calculateForecast(
 
     const float trend =
         static_cast<float>(
-            (validCount * sumXY - sumX * sumY)
-            / denominator);
+            (
+                validCount * sumXY -
+                sumX * sumY
+            ) / denominator);
 
     result.available = true;
     result.trendHpaPerHour = trend;
@@ -1226,7 +1637,6 @@ void processPendingPacket()
 
     interrupts();
 
-    // Garantisce che la label sia sempre terminata correttamente.
     localData.location[
         sizeof(localData.location) - 1
     ] = '\0';
@@ -1266,7 +1676,9 @@ void processPendingPacket()
         isPressureValid(
             localData.pressure);
 
-    if (!temperatureValid || !humidityValid)
+    if (
+        !temperatureValid ||
+        !humidityValid)
     {
         sensor.invalidPacketCount++;
 
@@ -1291,13 +1703,16 @@ void processPendingPacket()
             sensor,
             "Pressione fuori dal campo operativo: il valore barometrico e stato ignorato.");
 
-        localData.pressure = 0.0F;
+        localData.pressure =
+            0.0F;
     }
     else if (
         pressurePresent &&
         (
-            localData.pressure < SUSPICIOUS_PRESSURE_LOW ||
-            localData.pressure > SUSPICIOUS_PRESSURE_HIGH
+            localData.pressure <
+                SUSPICIOUS_PRESSURE_LOW ||
+            localData.pressure >
+                SUSPICIOUS_PRESSURE_HIGH
         ))
     {
         setWarning(
@@ -1308,13 +1723,16 @@ void processPendingPacket()
     sensor.currentData =
         localData;
 
-    sensor.hasData = true;
+    sensor.hasData =
+        true;
 
     sensor.hasPressure =
         localData.pressure > 0.0F;
 
     sensor.packetCount++;
-    sensor.lastUpdateMs = millis();
+
+    sensor.lastUpdateMs =
+        millis();
 
     addHistorySample(
         sensor,
@@ -1364,7 +1782,8 @@ void handleSensorsApi()
     String json;
 
     json.reserve(
-        512 + activeSensorCount * 600);
+        512 +
+        activeSensorCount * 600);
 
     json += '[';
 
@@ -1397,61 +1816,83 @@ void handleSensorsApi()
             calculateForecast(sensor);
 
         json += F("{\"name\":\"");
-        jsonEscapeAppend(json, sensor.name);
+
+        jsonEscapeAppend(
+            json,
+            sensor.name);
 
         json += F("\",\"mac\":\"");
+
         json += sensor.macStr;
 
         json += F("\",\"valid\":");
-        json += sensor.hasData ? F("true") : F("false");
+
+        json +=
+            sensor.hasData
+                ? F("true")
+                : F("false");
 
         json += F(",\"online\":");
-        json += online ? F("true") : F("false");
+
+        json +=
+            online
+                ? F("true")
+                : F("false");
 
         json += F(",\"temperature\":");
+
         json += String(
             sensor.currentData.temperature,
             1);
 
         json += F(",\"humidity\":");
+
         json += String(
             sensor.currentData.humidity,
             1);
 
         json += F(",\"pressure\":");
+
         json += String(
             sensor.currentData.pressure,
             1);
 
         json += F(",\"hasPressure\":");
+
         json +=
             sensor.hasPressure
                 ? F("true")
                 : F("false");
 
         json += F(",\"packets\":");
+
         json += String(
             sensor.packetCount);
 
         json += F(",\"invalidPackets\":");
+
         json += String(
             sensor.invalidPacketCount);
 
         json += F(",\"samples\":");
+
         json += String(
             sensor.historyCount);
 
         json += F(",\"ageSeconds\":");
+
         json += String(
             ageMs / 1000UL);
 
         json += F(",\"warning\":");
+
         json +=
             sensor.warningActive
                 ? F("true")
                 : F("false");
 
         json += F(",\"warningText\":\"");
+
         jsonEscapeAppend(
             json,
             sensor.warning);
@@ -1459,31 +1900,37 @@ void handleSensorsApi()
         json += F("\",\"forecast\":{");
 
         json += F("\"available\":");
+
         json +=
             forecast.available
                 ? F("true")
                 : F("false");
 
         json += F(",\"trend\":");
+
         json += String(
             forecast.trendHpaPerHour,
             2);
 
         json += F(",\"hours\":");
+
         json += String(
             forecast.observedHours,
             1);
 
         json += F(",\"samples\":");
+
         json += String(
             forecast.pressureSamples);
 
         json += F(",\"title\":\"");
+
         jsonEscapeAppend(
             json,
             forecast.title);
 
         json += F("\",\"description\":\"");
+
         jsonEscapeAppend(
             json,
             forecast.description);
@@ -1540,7 +1987,8 @@ void handleHistoryApi()
     String json;
 
     json.reserve(
-        2 + sensor.historyCount * 82);
+        2 +
+        sensor.historyCount * 82);
 
     json += '[';
 
@@ -1555,28 +2003,41 @@ void handleHistoryApi()
         }
 
         const uint16_t index =
-            (sensor.historyStart + position)
-            % HISTORY_SIZE;
+            (
+                sensor.historyStart +
+                position
+            ) % HISTORY_SIZE;
 
         const HistorySample &sample =
             sensor.historyBuffer[index];
 
         json += F("{\"temperature\":");
+
         json += String(
             sample.temperature,
             1);
 
         json += F(",\"humidity\":");
+
         json += String(
             sample.humidity,
             1);
 
         json += F(",\"pressure\":");
+
         json += String(
             sample.pressure,
             1);
 
+        // ====================================================
+        // Tempo relativo al boot.
+        // Il browser lo utilizza per costruire la scala:
+        //
+        // -4h -3h -2h -1h ora
+        // ====================================================
+
         json += F(",\"time\":");
+
         json += String(
             sample.timestampSeconds);
 
@@ -1595,6 +2056,10 @@ void handleHistoryApi()
         json);
 }
 
+// ============================================================
+// ROOT
+// ============================================================
+
 void handleRoot()
 {
     server.send_P(
@@ -1610,13 +2075,14 @@ void handleRoot()
 bool startAccessPoint()
 {
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP_STA);
+
+    WiFi.mode(
+        WIFI_AP_STA);
+
     WiFi.disconnect();
 
     delay(100);
 
-    WiFi.setOutputPower(20.5);
-    
     const bool started =
         WiFi.softAP(
             AP_SSID,
@@ -1676,7 +2142,8 @@ bool startEspNow()
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+
+    delay(50);
 
     Serial.println();
     Serial.println(
@@ -1690,6 +2157,9 @@ void setup()
 
     Serial.println(
         F("================================"));
+
+    Serial.println(
+        F("Modalita tempo: relativa al boot"));
 
     if (!startAccessPoint())
     {
@@ -1712,6 +2182,12 @@ void setup()
             yield();
         }
     }
+
+    // ========================================================
+    // ROUTES WEB
+    //
+    // Nessuna route RTC.
+    // ========================================================
 
     server.on(
         "/",
@@ -1744,6 +2220,8 @@ void setup()
 void loop()
 {
     processPendingPacket();
+
     server.handleClient();
+
     yield();
 }
